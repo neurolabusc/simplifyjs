@@ -1,3 +1,6 @@
+import { simplifyJS } from './simplify.js'
+
+
 (function(){function r(e,n,t){function o(i,f){if(!n[i]){if(!e[i]){var c="function"==typeof require&&require;if(!f&&c)return c(i,!0);if(u)return u(i,!0);var a=new Error("Cannot find module '"+i+"'");throw a.code="MODULE_NOT_FOUND",a}var p=n[i]={exports:{}};e[i][0].call(p.exports,function(r){var n=e[i][1][r];return o(n||r)},p,p.exports,r,e,n,t)}return n[i].exports}for(var u="function"==typeof require&&require,i=0;i<t.length;i++)o(t[i]);return o}return r})()({1:[function(require,module,exports){
 'use strict'
 var _three = require('three')
@@ -11,13 +14,17 @@ var _teapot2 = _interopRequireDefault(_teapot)
 var _decimate = require('../../src/decimate')
 var _glMatrix = require('gl-matrix')
 var _simplify = require('../../src/simplify')
+
+
 function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
 function _interopRequireWildcard(obj) { if (obj && obj.__esModule) { return obj; } else { var newObj = {}; if (obj != null) { for (var key in obj) { if (Object.prototype.hasOwnProperty.call(obj, key)) newObj[key] = obj[key]; } } newObj.default = obj; return newObj; } }
 var camera, scene, renderer
-var geometry, material, mesh
-var worker = null
+var geometry, material, mesh, method
 var tt = null
-var emscripten_worker = null
+var wasm_worker = null
+var koo_worker = null
+var niivue_worker = null
+var startTime = Date.now()
 class GUIHelper {
     constructor() {
         this.decimate = 1000
@@ -27,8 +34,6 @@ class GUIHelper {
         this.max_error = 1e-3
         this.agressiveness = 7
         this.update = 5
-        this.recompute = false
-        this.emscripten = false
         this.animation = true
         var paramKlein = function (u, v, p) {
             u *= Math.PI
@@ -69,6 +74,21 @@ class GUIHelper {
             var z = Math.pow(1.2, v) * Math.pow(Math.sin(u), 0.3) * Math.cos(v)
             return new THREE.Vector3(x, y, z)
         }
+        this.methods = {
+            WASM: {
+                has_texture: true
+            },
+            NiiVue: {
+                has_texture: false
+            },
+            Koo: {
+                has_texture: true
+            },
+            MainThread: {
+                has_texture: false
+            }
+        }
+        this.method = 'NiiVue'
         this.meshes = {
             bunny: {
                 geometry: create_bunny(_bunny2.default),
@@ -124,7 +144,7 @@ class GUIHelper {
         }
         this.meshes.klein.geometry.scale(0.05, 0.05, 0.05)
         this.meshes.klein.geometry.rotateX(-Math.PI / 3)
-        this.mesh = 'sphere'
+        this.mesh = 'klein'
     }
     create_lathe() {
         var points = []
@@ -226,7 +246,6 @@ function init() {
     helper = new GUIHelper()
     camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 10)
     camera.position.z = 1
-    helper.brain = []
     loadFreeSurfer('./lh.pial').then(mesh => {
         helper.meshes.brain = {
             geometry: create_bunny(mesh, 0.008),
@@ -236,19 +255,22 @@ function init() {
     })
 
     scene = new THREE.Scene()
-    scene.background = new THREE.Color(0xaaccff)
+    //scene.background = new THREE.Color(0xaaccff)
+    scene.background = new THREE.Color(0x000000)
+    method = helper.methods[helper.method].has_texture
     geometry = helper.meshes[helper.mesh].geometry
     material = helper.meshes[helper.mesh].material
     helper.map = earthTexture
-    helper.decimate = geometry.faces.length
+    helper.decimate = 100
     mesh = new THREE.Mesh(geometry, material)
     scene.add(mesh)
     renderer = new THREE.WebGLRenderer({ antialias: true })
     renderer.setPixelRatio(window.devicePixelRatio)
     renderer.setSize(window.innerWidth, window.innerHeight)
     document.body.appendChild(renderer.domElement)
-    worker = new Worker('./decimate-worker.js?rnd=' + Math.random())
-    emscripten_worker = new Worker('./worker.js?rnd=' + Math.random())
+    koo_worker = new Worker('./decimate-worker.js?rnd=' + Math.random())
+    niivue_worker = new Worker('./niivue-worker.js?rnd=' + Math.random(), { type: 'module' });
+    wasm_worker = new Worker('./worker.js?rnd=' + Math.random())
     initGUI()
 }
 function animate() {
@@ -491,19 +513,6 @@ function create_bunny(bunny, scale = 0.07) {
 function initGUI() {
     let gui = new _dat2.default.GUI()
     let wl = gui.add(helper, 'log')
-    gui.add(helper, 'emscripten').onChange(v => {
-        if (v) {
-            ctl_update.domElement.style.opacity = .2
-            ctl_update.domElement.style.pointerEvents = "none"
-            ctl_recompute.domElement.style.opacity = .2
-            ctl_recompute.domElement.style.pointerEvents = "none"
-        } else {
-            ctl_update.domElement.style.opacity = 1
-            ctl_update.domElement.style.pointerEvents = "auto"
-            ctl_recompute.domElement.style.opacity = 1
-            ctl_recompute.domElement.style.pointerEvents = "auto"
-        }
-    })
     let wc = gui.add(material, 'wireframe').onChange(v => {
         if (v) {
             mesh.material.map = null
@@ -516,64 +525,131 @@ function initGUI() {
     gui.add(helper, 'mesh', Object.keys(helper.meshes)).onChange(m => {
         mesh.geometry = helper.meshes[m].geometry
         mesh.material = helper.meshes[m].material
-        tt.max(mesh.geometry.faces.length)
-        tt.setValue(mesh.geometry.faces.length)
+        tt.max(100)
+        tt.setValue(100)
+        //tt.max(mesh.geometry.faces.length)
+        //tt.setValue(mesh.geometry.faces.length)
         wc.object = mesh.material
         wc.setValue(mesh.material.wireframe)
     })
-    tt = gui.add(helper, 'decimate', 0, mesh.geometry.faces.length).step(1).onFinishChange(v => {
-        if (helper.emscripten) {
+    function doDecimate () {
+        let frac = helper.decimate / 100
+        if (frac >= 1.0) {
+            let geo = helper.meshes[helper.mesh].geometry
+            mesh.geometry = geo
+            return
+        }
+        tt.domElement.style.opacity = .2
+        tt.domElement.style.pointerEvents = "none"
+        wl.setValue('working...')
+        // we will measure end-to-end time
+        // WASM startup and writing/reading ASCII data are slow
+        startTime = Date.now()
+        let has_texture = helper.meshes[helper.mesh].has_texture
+        if ((helper.methods === 'MainThread') && (!has_texture)){
+            let geo = helper.meshes[helper.mesh].geometry
+            let verts = new Float32Array(geo.vertices.length * 3)
+            let j = 0
+            for (let i = 0; i < geo.vertices.length; i++) {
+                verts[j++] = geo.vertices[i].x
+                verts[j++] = geo.vertices[i].y
+                verts[j++] = geo.vertices[i].z
+            }
+            let tris = new Uint32Array(geo.faces.length * 3)
+            j = 0
+            for (let i = 0; i < geo.faces.length; i++) {
+                tris[j++] = geo.faces[i].a
+                tris[j++] = geo.faces[i].b
+                tris[j++] = geo.faces[i].c
+            }
+            let t = Date.now()
+            let g = simplifyJS(verts, tris, frac, helper.agressiveness)
+            let took = Date.now() - t
+            let uvs = null
+            mesh.geometry = simplify_to_geometry_buffers(g.vertices, uvs, g.triangles)
+            wl.setValue(`MainThread ${took}ms`)
+            tt.domElement.style.opacity = 1
+            tt.domElement.style.pointerEvents = "auto"
+        } else if (helper.methods === 'WASM') {
             let obj = geometry_to_obj(helper.meshes[helper.mesh].geometry)
-            let perc = v / helper.meshes[helper.mesh].geometry.faces.length
             let blob = new Blob([obj], {
                 type: 'text/plain'
             })
             let name = `em${Math.round(Math.random() * 0xffffff)}.obj`
             let file = new File([blob], name)
-            tt.domElement.style.opacity = .2
-            tt.domElement.style.pointerEvents = "none"
-            wl.setValue('working...')
-            emscripten_worker.postMessage({
+            wasm_worker.postMessage({
                 blob: file,
-                percentage: perc,
+                percentage: frac,
                 simplify_name: name,
                 agressiveness: helper.agressiveness,
-                recompute: helper.recompute,
+                recompute: false,
                 update: helper.update
             })
+        } else if ((helper.methods === 'NiiVue') && (!has_texture)) {
+            // n.b. we convert geometry to flat arrays on the main thread
+            // this allows us to pass buffers to web worker as Transferable Objects
+            let geo = helper.meshes[helper.mesh].geometry
+            let verts = new Float32Array(geo.vertices.length * 3)
+            let j = 0
+            for (let i = 0; i < geo.vertices.length; i++) {
+                verts[j++] = geo.vertices[i].x
+                verts[j++] = geo.vertices[i].y
+                verts[j++] = geo.vertices[i].z
+            }
+            let tris = new Uint32Array(geo.faces.length * 3)
+            j = 0
+            for (let i = 0; i < geo.faces.length; i++) {
+                tris[j++] = geo.faces[i].a
+                tris[j++] = geo.faces[i].b
+                tris[j++] = geo.faces[i].c
+            }
+            let geometry = helper.meshes[helper.mesh].geometry
+            let o = {
+                vertices: verts,
+                indices: tris,
+                fraction: frac,
+                agressiveness: helper.agressiveness
+            }
+            niivue_worker.postMessage(o, [o.vertices.buffer, o.indices.buffer])
         } else {
             let geometry = geometry_to_simplify(helper.meshes[helper.mesh].geometry)
+            let v = Math.ceil(frac * helper.meshes[helper.mesh].geometry.faces.length)
             let o = {
                 geometry: geometry,
                 target: v,
                 options: {
                     agressiveness: helper.agressiveness,
-                    recompute: helper.recompute,
+                    recompute: false,
                     update: helper.update
                 },
                 vertices: new Float32Array(geometry.triangles.length * 3 * 3),
                 uvs: new Float32Array(geometry.triangles.length * 3 * 2),
                 indices: new Uint32Array(geometry.triangles.length * 3)
             }
-            tt.domElement.style.opacity = .2
-            tt.domElement.style.pointerEvents = "none"
-            wl.setValue('working...')
-            worker.postMessage(o, [o.vertices.buffer, o.indices.buffer])
+            koo_worker.postMessage(o, [o.vertices.buffer, o.indices.buffer])
         }
+    
+    }
+    tt = gui.add(helper, 'decimate', 0, 100).step(1).onFinishChange(v => {
+        doDecimate()
     })
-    gui.add(helper, 'agressiveness', 1, 20).step(1)
-    let ctl_update = gui.add(helper, 'update', 1, 10).step(1)
-    let ctl_recompute = gui.add(helper, 'recompute')
+    gui.add(helper, 'methods', Object.keys(helper.methods)).onFinishChange(v => {
+        doDecimate()
+    }).setValue(helper.method);
+
+    gui.add(helper, 'agressiveness', 1, 20).step(1).onFinishChange(v => {
+        doDecimate()
+    })
     let ctl_animate = gui.add(helper, 'animation')
-    worker.addEventListener('message', e => {
+    koo_worker.addEventListener('message', e => {
         mesh.geometry = simplify_to_geometry_buffers(e.data.vertices, e.data.uvs, e.data.indices)
         if (1) {
             tt.domElement.style.opacity = 1
             tt.domElement.style.pointerEvents = "auto"
-            wl.setValue(`decimate ${e.data.took}ms`)
+            wl.setValue(`Koo ${Date.now() - startTime}ms`)
         }
     }, false)
-    emscripten_worker.addEventListener('message', e => {
+    wasm_worker.addEventListener('message', e => {
         if (e.data.blob instanceof Blob) {
             console.log('receiving blob')
             var reader = new FileReader()
@@ -582,9 +658,17 @@ function initGUI() {
                 mesh.geometry = obj_to_geometry(reader.result)
                 tt.domElement.style.opacity = 1
                 tt.domElement.style.pointerEvents = "auto"
-                wl.setValue(`decimate ${e.data.took}ms`)
+                wl.setValue(`WASM ${Date.now() - startTime}ms`)
             }
             reader.readAsText(e.data.blob)
+        }
+    }, false)
+    niivue_worker.addEventListener('message', e => {
+        mesh.geometry = simplify_to_geometry_buffers(e.data.vertices, null, e.data.triangles)
+        if (1) {
+            tt.domElement.style.opacity = 1
+            tt.domElement.style.pointerEvents = "auto"
+            wl.setValue(`NiiVue ${Date.now() - startTime}ms`)
         }
     }, false)
 }
