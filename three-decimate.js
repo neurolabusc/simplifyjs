@@ -22,6 +22,7 @@ var camera, scene, renderer
 var geometry, material, mesh, method
 var tt = null
 var wasm_worker = null
+var wasm_workerMZ3 = null
 var koo_worker = null
 var niivue_worker = null
 var startTime = Date.now()
@@ -78,6 +79,9 @@ class GUIHelper {
             WASM: {
                 has_texture: true
             },
+            WASMmz3: {
+                has_texture: true
+            },
             NiiVue: {
                 has_texture: false
             },
@@ -88,7 +92,7 @@ class GUIHelper {
                 has_texture: false
             }
         }
-        this.method = 'NiiVue'
+        this.method = 'WASMmz3'
         this.meshes = {
             bunny: {
                 geometry: create_bunny(_bunny2.default),
@@ -187,56 +191,109 @@ let earthTexture = new THREE.TextureLoader().load('./earth.jpg', () => {
 
 })
 
-async function loadFreeSurfer(filePath) {
+function mz3_to_geometry(verts, tris) {
+    let geom = new THREE.BufferGeometry(),
+        lines = [],
+        vertices = [],
+        uvs = [],
+        uv_indices = [],
+        indices = []
+    geom.addAttribute('position', new THREE.BufferAttribute(new Float32Array(verts), 3))
+    geom.setIndex(new THREE.BufferAttribute(new Uint32Array(tris), 1))
+    geom = new THREE.Geometry().fromBufferGeometry(geom)
+    geom.mergeVertices()
+    geom.computeFaceNormals()
+    return geom
+}
+
+function mz3_to_arrayBuffer(vertices, indices) {
+    // generate arrayBuffer in MZ3 format mesh
+    const magic = 23117
+    const attr = 3
+    const nface = indices.length / 3
+    const nvert = vertices.length / 3
+    const nskip = 0
+    // Calculate buffer size
+    const headerSize = 16
+    const indexSize = nface * 3 * 4 // Uint32Array
+    const vertexSize = nvert * 3 * 4 // Float32Array
+    const totalSize = headerSize + indexSize + vertexSize
+    const buffer = new ArrayBuffer(totalSize)
+    const writer = new DataView(buffer)
+    // Write header
+    writer.setUint16(0, magic, true)
+    writer.setUint16(2, attr, true)
+    writer.setUint32(4, nface, true)
+    writer.setUint32(8, nvert, true)
+    writer.setUint32(12, nskip, true)
+    // Write indices
+    let offset = headerSize
+    new Uint32Array(buffer, offset, indices.length).set(indices)
+    offset += indexSize
+    // Write vertices
+    new Float32Array(buffer, offset, vertices.length).set(vertices)
+    return buffer
+}
+async function loadMz3core(buffer, scale = 1, swizzle = false) {
+        let reader = await new DataView(buffer)
+        // get number of vertices and faces
+        let magic = reader.getUint16(0, true)
+        if (magic === 35615 || magic === 8075) {
+          throw new Error(`Unable to read compressed mz3 files`)
+        }
+        const attr = reader.getUint16(2, true)
+        const nface = reader.getUint32(4, true)
+        let nvert = reader.getUint32(8, true)
+        const nskip = reader.getUint32(12, true)
+        // console.log('MZ3 magic %d attr %d face %d vert %d skip %d', magic, attr, nface, nvert, nskip)
+        if (magic !== 23117) {
+          throw new Error('Invalid MZ3 file')
+        }
+        let bytesPerScalar = 4
+        if (nvert < 3) {
+          throw new Error('Not a mesh MZ3 file (maybe scalar)')
+        }
+        let filepos = 16 + nskip
+        let indices = null
+        indices = await new Uint32Array(buffer, filepos, nface * 3)
+        filepos += nface * 3 * 4
+        let pts = await new Float32Array(buffer, filepos, nvert * 3)
+        if (swizzle) {
+            let ptsJKI = new Float32Array(pts)
+            let j = 0
+            let k = 0
+            for (let i = 0; i < nvert; i++) {
+                pts[k++] = ptsJKI[j + 1]
+                pts[k++] = ptsJKI[j + 2]
+                pts[k++] = ptsJKI[j + 0]
+                j += 3
+            }
+        }
+        if (scale !== 1.0) {
+            for (let i = 0; i < pts.length; i++)
+                pts[i] *= scale
+        }
+        return mz3_to_geometry(pts, indices)
+        //return {pts, indices}
+}
+
+async function loadMz3(filePath, scale = 0.007) {
     try {
         const response = await fetch(filePath)
         if (!response.ok) {
             throw new Error(`Failed to load file: ${response.statusText}`)
         }
-        const arrayBuffer = await response.arrayBuffer()
-        const bytes = new Uint8Array(arrayBuffer)
-        if (bytes[0] === 35 && bytes[1] === 33 && bytes[2] === 97) {
-          return NVMeshLoaders.readASC(buffer) // "#!ascii version"
-        }
-        const view = new DataView(arrayBuffer) // ArrayBuffer to dataview
-        const sig0 = view.getUint32(0, false)
-        const sig1 = view.getUint32(4, false)
-        if (sig0 !== 4294966883 || sig1 !== 1919246708) {
-          utiltiesLogger.debug('Unable to recognize file type: does not appear to be FreeSurfer format.')
-        }
-        let offset = 0
-        while (view.getUint8(offset) !== 10) {
-          offset++
-        }
-        offset += 2
-        let nv = view.getUint32(offset, false) // number of vertices
-        offset += 4
-        let nf = view.getUint32(offset, false) // number of faces
-        offset += 4
-        nv *= 3 // each vertex has 3 positions: XYZ
-        const pts = new Float32Array(nv)
-        for (let i = 0; i < nv; i++) {
-          pts[i] = view.getFloat32(offset, false)
-          offset += 4
-        }
-        nf *= 3 // each triangle face indexes 3 triangles
-        const indices = new Uint32Array(nf)
-        for (let i = 0; i < nf; i++) {
-          indices[i] = view.getUint32(offset, false)
-          offset += 4
-        }
+        const buffer = await response.arrayBuffer()
+        return loadMz3core(buffer, 0.007, true)
+    } catch (error) {
+        console.error('Error loading file as ArrayBuffer:', error)
+    }
+}
 
-        const positions = []
-        for (let i = 0; i < pts.length; i += 3) {
-            positions.push([ pts[i + 1], pts[i + 2], pts[i]])
-        }
-        const cells = []
-        for (let i = 0; i < indices.length; i += 3) {
-            cells.push([indices[i], indices[i + 1], indices[i + 2]])
-        }
-
-
-        return {positions, cells}
+async function loadMz3x(reader) {
+    try {
+        const buffer = await reader.result
+        return loadMz3core(buffer)
     } catch (error) {
         console.error('Error loading file as ArrayBuffer:', error)
     }
@@ -246,9 +303,10 @@ function init() {
     helper = new GUIHelper()
     camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 10)
     camera.position.z = 1
-    loadFreeSurfer('./lh.pial').then(mesh => {
+    //loadFreeSurfer('./lh.pial').then(mesh => {
+    loadMz3('./lh.mz3').then(mz3 => {
         helper.meshes.brain = {
-            geometry: create_bunny(mesh, 0.008),
+            geometry: mz3, //mz3_to_geometry(mz3.pts, mz3.indices),
             material: new THREE.MeshNormalMaterial({ wireframe: true, side: THREE.DoubleSide }),
             has_texture: false
         }
@@ -269,8 +327,9 @@ function init() {
     renderer.setSize(window.innerWidth, window.innerHeight)
     document.body.appendChild(renderer.domElement)
     koo_worker = new Worker('./decimate-worker.js?rnd=' + Math.random())
+    wasm_worker = new Worker('./worker.js?rnd=' + Math.random());
+    wasm_workerMZ3 = new Worker('./worker.js?rnd=' + Math.random());
     niivue_worker = new Worker('./niivue-worker.js?rnd=' + Math.random(), { type: 'module' });
-    wasm_worker = new Worker('./worker.js?rnd=' + Math.random())
     initGUI()
 }
 function animate() {
@@ -321,6 +380,7 @@ function geometry_to_obj(geometry) {
     }
     return obj
 }
+
 function obj_to_geometry(obj) {
     let geometry = new THREE.BufferGeometry(),
         lines = obj.split(/[\r\n]/).filter(ln => ln && ln.length),
@@ -570,17 +630,50 @@ function initGUI() {
             wl.setValue(`MainThread ${took}ms`)
             tt.domElement.style.opacity = 1
             tt.domElement.style.pointerEvents = "auto"
-        } else if (helper.methods === 'WASM') {
+        } else if ((helper.methods === 'WASMmz3') && (!has_texture)) {
+            let verts = helper.meshes[helper.mesh].geometry.vertices
+            let tris = helper.meshes[helper.mesh].geometry.faces
+            let vs = new Float32Array(verts.length * 3)
+            let ts = new Uint32Array(tris.length * 3)
+            let j = 0
+            for (let i = 0; i < verts.length; i++) {
+                vs[j++] = verts[i].x
+                vs[j++] = verts[i].y
+                vs[j++] = verts[i].z
+            }
+            j = 0
+            for (let i = 0; i < tris.length; i++) {
+                ts[j++] = tris[i].a
+                ts[j++] = tris[i].b
+                ts[j++] = tris[i].c
+            }
+            let mz3 = new Blob([mz3_to_arrayBuffer(vs, ts)], {
+                type: 'application/octet-stream'
+            })
+            let name = `em${Math.round(Math.random() * 0xffffff)}.mz3`
+            let file = new File([mz3], name)
+            let name2 = `em${Math.round(Math.random() * 0xffffff)}.mz3`
+            wasm_workerMZ3.postMessage({
+                blob: file,
+                percentage: frac,
+                simplify_name: name2,
+                agressiveness: helper.agressiveness,
+                recompute: false,
+                update: helper.update
+            })
+        } else if ((helper.methods === 'WASM') || (helper.methods === 'WASMmz3')) {
+            //Use OBJ for WASMmz3 if mesh has UVs
             let obj = geometry_to_obj(helper.meshes[helper.mesh].geometry)
             let blob = new Blob([obj], {
                 type: 'text/plain'
             })
             let name = `em${Math.round(Math.random() * 0xffffff)}.obj`
             let file = new File([blob], name)
+            let name2 = `em${Math.round(Math.random() * 0xffffff)}.obj`
             wasm_worker.postMessage({
                 blob: file,
                 percentage: frac,
-                simplify_name: name,
+                simplify_name: name2,
                 agressiveness: helper.agressiveness,
                 recompute: false,
                 update: helper.update
@@ -649,9 +742,23 @@ function initGUI() {
             wl.setValue(`Koo ${Date.now() - startTime}ms`)
         }
     }, false)
+    wasm_workerMZ3.addEventListener('message', e => {
+        if (e.data.blob instanceof Blob) {
+            var reader = new FileReader()
+            reader.onload = () => {
+                loadMz3core(reader.result).then((mz3) => {
+                    mesh.geometry = mz3 // mz3_to_geometry(mz3.pts, mz3.indices)
+                    tt.domElement.style.opacity = 1
+                    tt.domElement.style.pointerEvents = "auto"
+                    wl.setValue(`WASM ${Date.now() - startTime}ms`)
+
+                })
+            }
+            reader.readAsArrayBuffer(e.data.blob)
+        }
+    }, false)
     wasm_worker.addEventListener('message', e => {
         if (e.data.blob instanceof Blob) {
-            console.log('receiving blob')
             var reader = new FileReader()
             reader.onload = () => {
                 console.log('read file')
